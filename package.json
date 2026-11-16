@@ -1,0 +1,11 @@
+{
+  "name": "minecraft-bot",
+  "version": "1.0.0",
+  "main": "pika.js",
+  "scripts": {
+    "start": "node pika.js"
+  },
+  "dependencies": {
+    "@wp2508/mineflayer": "latest"
+  }
+}
