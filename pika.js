@@ -4,7 +4,7 @@ const mineflayer = require('@wp2508/mineflayer');
 const CONFIG = {
     host: 'play.pika-network.net',
     port: 25565,
-    username: 'botiee',
+    username: 'theplayeroftnt',
     auth: 'offline',
     version: '1.21.8',
     hideErrors: false,
