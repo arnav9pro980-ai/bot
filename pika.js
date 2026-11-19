@@ -1,317 +1,583 @@
-
 const mineflayer = require('@wp2508/mineflayer');
 
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 const CONFIG = {
-    host: 'play.pika-network.net',
+    host: 'play.bananasmp.net',
     port: 25565,
-    username: 'theplayeroftnt',
     auth: 'offline',
-    version: '1.21.8',
+    version: '1.21.10',
     hideErrors: false,
     checkTimeoutInterval: 60000
 };
 
 const PASSWORD = 'patrickjane';
-const TARGET_MODE = 'oplifesteal';
-const TPA_TARGET = 'DudeTNT';
+const DUDETNT = 'DudeTNT';
 
-let registered = false;
-let loggingIn = false;
-let selectorUsed = false;
-let modeSelected = false;
-let processingWindow = false;
+const MAX_BOTS = 20;
+const SPAWN_DELAY = 10000;
+const FIRST_SPAWN_DELAY = 0;
 
-let hasEnteredMode = false;
-let awaitingRespawn = false;
-let stopped = false;
-let loginCount = 0;
+const TPA_RETRY_DELAY = 15000;
+const TPA_CONFIRM_DELAY = 1500;
+const DEATH_RESPAWN_DELAY = 2000;
 
-function log(message) {
-    console.log(`[BOT] ${message}`);
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+
+const bots = new Map();
+
+let botCounter = 0;
+let spawnTimer = null;
+let shuttingDown = false;
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function log(role, message) {
+    console.log(`[${role}] ${message}`);
 }
 
 function delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function normalize(text) {
-    return String(text || '')
+function normalize(value) {
+    return String(value || '')
         .toLowerCase()
-        .replace(/§[0-9a-fk-or]/g, '')
+        .replace(/§[0-9a-fk-or]/gi, '')
         .replace(/[^a-z0-9]/g, '');
 }
 
+function randomThreeLetters() {
+    return Array.from({ length: 3 }, () =>
+        String.fromCharCode(97 + Math.floor(Math.random() * 26))
+    ).join('');
+}
+
+function extractText(value, output = []) {
+    if (value === null || value === undefined) return output;
+
+    if (typeof value === 'string' || typeof value === 'number') {
+        output.push(String(value));
+        return output;
+    }
+
+    if (Array.isArray(value)) {
+        for (const item of value) extractText(item, output);
+        return output;
+    }
+
+    if (typeof value === 'object') {
+        if (typeof value.text === 'string') output.push(value.text);
+        if (typeof value.translate === 'string') output.push(value.translate);
+        if (value.with) extractText(value.with, output);
+        if (value.extra) extractText(value.extra, output);
+        if (value.value !== undefined) extractText(value.value, output);
+        if (value.children) extractText(value.children, output);
+    }
+
+    return output;
+}
+
 function getMessageText(message) {
+    if (typeof message === 'string') return message;
+    if (!message) return '';
+
+    const output = [];
+
     try {
-        return typeof message === 'string'
-            ? message
-            : message.toString();
+        if (typeof message.toJSON === 'function') {
+            extractText(message.toJSON(), output);
+        }
+
+        if (typeof message.toString === 'function') {
+            const readable = message.toString();
+
+            if (readable && readable !== '[object Object]') {
+                output.push(readable);
+            }
+        }
+
+        if (!output.length) extractText(message, output);
     } catch {
         return String(message);
     }
+
+    return output.join(' ');
 }
 
 function getItemText(item) {
     if (!item) return '';
 
+    let nbt = '';
+
+    try {
+        nbt = item.nbt ? JSON.stringify(item.nbt) : '';
+    } catch {}
+
     return [
         item.name,
         item.displayName,
         item.customName,
-        item.nbt ? JSON.stringify(item.nbt) : ''
+        nbt
     ].join(' ');
 }
 
-function isBanMessage(message) {
-    const text = normalize(getMessageText(message));
-
-    return (
-        text.includes('banned') ||
-        text.includes('permanentlybanned') ||
-        text.includes('temporarilybanned') ||
-        text.includes('0hearts') ||
-        text.includes('zerohearts') ||
-        text.includes('noheartsleft') ||
-        text.includes('outofhearts')
-    );
-}
-
-function stopBot(reason) {
-    if (stopped) return;
-
-    stopped = true;
-
-    log('================================');
-    log('BOT STOPPING');
-    log(reason);
-    log('================================');
-
-    clearInterval(selectorInterval);
-
-    try {
-        bot.quit();
-    } catch {}
-}
-
 // ============================================================
-// TPA
+// BOT CREATION
 // ============================================================
 
-let tpaTimer = null;
+function createBot(username) {
+    const bot = mineflayer.createBot({
+        ...CONFIG,
+        username
+    });
 
-function enterMode(reason) {
-    if (stopped || hasEnteredMode) return;
+    const state = {
+        stopped: false,
 
-    hasEnteredMode = true;
+        registered: false,
+        loggingIn: false,
+        authReady: false,
 
-    log(`OP Lifesteal detected: ${reason}`);
+        lastAuthCommand: 0,
 
-    tpaTimer = setTimeout(() => {
-        if (stopped || !bot.entity) return;
+        selectorUsed: false,
+        selectorBusy: false,
+        modeSelected: false,
+        hasEnteredMode: false,
 
-        log(`Sending /tpa ${TPA_TARGET}`);
-        bot.chat(`/tpa ${TPA_TARGET}`);
-    }, 2500);
-}
+        awaitingTpaGui: false,
+        teleportPending: false,
 
-function sendTPAAfterRespawn() {
-    if (stopped || !hasEnteredMode) return;
+        processingWindow: false,
+        windowQueue: Promise.resolve(),
 
-    setTimeout(() => {
-        if (stopped || !bot.entity) return;
+        eating: false,
 
-        log(`Sending /tpa ${TPA_TARGET} after respawn`);
-        bot.chat(`/tpa ${TPA_TARGET}`);
-    }, 2500);
-}
+        selectorInterval: null,
+        foodInterval: null,
+        authTimer: null,
+        tpaTimer: null,
+        tpaRetryTimer: null,
+        respawnTimer: null
+    };
 
-// ============================================================
-// BOT
-// ============================================================
-
-const bot = mineflayer.createBot(CONFIG);
-
-// ============================================================
-// LOGIN
-// ============================================================
-
-bot.on('login', () => {
-    loginCount++;
-
-    log(`Logged in! (Login event ${loginCount})`);
-
-    // PikaNetwork can reconnect the bot when switching servers.
-    if (modeSelected && loginCount >= 2) {
-        enterMode('Server transfer login');
-    }
-});
-
-bot.on('spawn', () => {
-    if (stopped) return;
-
-    log(`Spawned as ${bot.username}`);
-
-    if (awaitingRespawn) {
-        awaitingRespawn = false;
-
-        log('Respawn detected!');
-        sendTPAAfterRespawn();
-    }
-});
-
-// ============================================================
-// CHAT / REGISTRATION / MODE DETECTION
-// ============================================================
-
-// ============================================================
-// CHAT DEATH DETECTION
-// ============================================================
-
-let deathTPASent = false;
-
-bot.on('message', message => {
-    if (stopped) return;
-
-    const text = message.toString();
-    const lower = text.toLowerCase();
-
-    console.log('[CHAT]', text);
-
-    // Ban detection
-    if (isBanMessage(text)) {
-        stopBot('Ban or zero-hearts message: ' + text);
-        return;
+    function botLog(message) {
+        log(username, message);
     }
 
-    // Actual PikaNetwork death message
-    if (lower.includes('you were killed by')) {
-        log('Death detected from server chat!');
+    // ========================================================
+    // TIMERS
+    // ========================================================
 
-        awaitingRespawn = true;
-        deathTPASent = false;
+    function clearTimers() {
+        clearInterval(state.selectorInterval);
+        clearInterval(state.foodInterval);
 
-        return;
+        clearTimeout(state.authTimer);
+        clearTimeout(state.tpaTimer);
+        clearTimeout(state.tpaRetryTimer);
+        clearTimeout(state.respawnTimer);
     }
 
-    // Detect respawn / return to the game.
-    if (
-        awaitingRespawn &&
-        (
-            lower.includes('fly mode enabled') ||
-            lower.includes('welcome to')
-        )
-    ) {
-        awaitingRespawn = false;
+    // ========================================================
+    // STOP
+    // ========================================================
 
-        log('Returned to the game after death.');
+    function stop(reason) {
+        if (state.stopped) return;
 
-        setTimeout(() => {
-            if (stopped || deathTPASent) return;
+        state.stopped = true;
 
-            deathTPASent = true;
+        botLog(`Stopping: ${reason}`);
 
-            log(`Sending /tpa ${TPA_TARGET} after death.`);
-            bot.chat(`/tpa ${TPA_TARGET}`);
-        }, 2500);
+        clearTimers();
+
+        try {
+            bot.quit();
+        } catch {}
     }
 
-    // Registration
-    if (!registered && lower.includes('please register')) {
-        registered = true;
+    // ========================================================
+    // AUTHENTICATION
+    // ========================================================
 
-        setTimeout(() => {
-            if (stopped) return;
+    function authenticationComplete() {
+        if (state.stopped || state.authReady) return;
+
+        state.authReady = true;
+        state.loggingIn = false;
+
+        botLog('Authentication successful.');
+
+        state.authTimer = setTimeout(() => {
+            if (state.stopped) return;
+
+            botLog('Inventory:');
+
+            for (const item of bot.inventory.items()) {
+                botLog(`${item.name} | ${item.displayName} | ${item.slot}`);
+            }
+        }, 3000);
+    }
+
+    function handleAuthentication(message) {
+        if (state.stopped || state.authReady) return;
+
+        const text = normalize(getMessageText(message));
+
+        if (!text) return;
+
+        const now = Date.now();
+
+        const success =
+            text.includes('successfullyloggedin') ||
+            text.includes('loggedinsuccessfully') ||
+            text.includes('loginsuccessful') ||
+            text.includes('successfullyregistered') ||
+            text.includes('registrationsuccessful') ||
+            text.includes('youarenowloggedin') ||
+            text.includes('authenticationsuccessful');
+
+        if (success) {
+            authenticationComplete();
+            return;
+        }
+
+        const register =
+            text.includes('registerusing') ||
+            text.includes('pleasecreateanaccount') ||
+            text.includes('notregistered');
+
+        if (
+            register &&
+            !state.registered &&
+            now - state.lastAuthCommand > 3000
+        ) {
+            state.registered = true;
+            state.lastAuthCommand = now;
+
+            botLog('Registering account...');
 
             bot.chat(`/register ${PASSWORD} ${PASSWORD}`);
-            log('Registration command sent.');
-        }, 1500);
+            return;
+        }
 
-        return;
-    }
+        const login =
+            text.includes('pleaselogin') ||
+            text.includes('loginusing') ||
+            text.includes('youneedtologin') ||
+            text.includes('pleaseauthenticate') ||
+            text.includes('authenticationrequired');
 
-    // Login
-    if (
-        !loggingIn &&
-        (
-            lower.includes('please login') ||
-            lower.includes('please log in') ||
-            lower.includes('/login')
-        )
-    ) {
-        loggingIn = true;
+        if (
+            login &&
+            !state.loggingIn &&
+            now - state.lastAuthCommand > 3000
+        ) {
+            state.loggingIn = true;
+            state.lastAuthCommand = now;
 
-        setTimeout(() => {
-            if (stopped) return;
+            botLog('Logging in...');
 
             bot.chat(`/login ${PASSWORD}`);
-            log('Login command sent.');
-        }, 1500);
+            return;
+        }
+
+        if (
+            text.includes('incorrectpassword') ||
+            text.includes('wrongpassword') ||
+            text.includes('invalidpassword')
+        ) {
+            state.loggingIn = false;
+            botLog('Incorrect password!');
+        }
     }
 
-    // Initial game entry
-    if (
-        modeSelected &&
-        !hasEnteredMode &&
-        lower.includes('fly mode enabled')
-    ) {
-        enterMode(text);
+    // ========================================================
+    // SERVER SELECTOR
+    // ========================================================
+
+    async function openServerSelector() {
+        if (
+            state.stopped ||
+            !state.authReady ||
+            state.selectorUsed ||
+            state.selectorBusy ||
+            !bot.entity
+        ) {
+            return;
+        }
+
+        state.selectorBusy = true;
+
+        try {
+            const items = bot.inventory.items();
+
+            const selector = items.find(item => {
+                const name = normalize(getItemText(item));
+
+                return (
+                    item.name === 'compass' ||
+                    name.includes('serverselector') ||
+                    name.includes('gameselector') ||
+                    name.includes('servermenu') ||
+                    name.includes('gamemenu')
+                );
+            });
+
+            if (!selector) return;
+
+            botLog(`Selector found: ${selector.name}`);
+
+            await bot.equip(selector, 'hand');
+            await delay(800);
+
+            if (state.stopped) return;
+
+            await bot.activateItem();
+
+            state.selectorUsed = true;
+
+            botLog('Server selector activated.');
+        } catch (err) {
+            botLog(`Selector error: ${err.message}`);
+        } finally {
+            state.selectorBusy = false;
+        }
     }
-});
-// ============================================================
-// SERVER SELECTOR
-// ============================================================
 
-async function openServerSelector() {
-    if (stopped || selectorUsed || !bot.entity) return;
+    // ========================================================
+    // LIFESTEAL
+    // ========================================================
 
-    const compass = bot.inventory.items().find(
-        item => item.name === 'compass'
-    );
+    function enterMode(reason) {
+        if (
+            state.stopped ||
+            state.hasEnteredMode
+        ) {
+            return;
+        }
 
-    if (!compass) {
-        log('Server Selector compass not found.');
-        return;
+        state.hasEnteredMode = true;
+
+        botLog(`Entered Lifesteal: ${reason}`);
+
+        setTimeout(() => {
+            if (state.stopped) return;
+
+            requestTeleport();
+        }, 2000);
     }
 
-    try {
-        log('Found Server Selector compass.');
+    // ========================================================
+    // TELEPORT
+    // ========================================================
 
-        await bot.equip(compass, 'hand');
-        await delay(1000);
+    function requestTeleport() {
+        if (
+            state.stopped ||
+            !state.authReady ||
+            !state.hasEnteredMode ||
+            state.awaitingTpaGui ||
+            state.teleportPending ||
+            !bot.entity
+        ) {
+            return;
+        }
 
-        if (stopped) return;
+        state.awaitingTpaGui = true;
 
-        log('Right-clicking Server Selector...');
+        botLog(`Sending TPA request to ${DUDETNT}...`);
 
-        selectorUsed = true;
-        bot.activateItem();
+        bot.chat(`/tpa ${DUDETNT}`);
 
-    } catch (err) {
-        log('Selector error: ' + err.message);
-        selectorUsed = false;
+        clearTimeout(state.tpaRetryTimer);
+
+        state.tpaRetryTimer = setTimeout(() => {
+            if (state.stopped || !state.awaitingTpaGui) return;
+
+            botLog('TPA confirmation timed out. Retrying.');
+
+            state.awaitingTpaGui = false;
+
+            requestTeleport();
+        }, TPA_RETRY_DELAY);
     }
-}
 
-// ============================================================
-// GUI
-// ============================================================
+    // ========================================================
+    // TPA GUI
+    // ========================================================
 
-bot.on('windowOpen', async window => {
-    if (stopped || processingWindow) return;
+    async function handleTpaWindow(window) {
+        if (!state.awaitingTpaGui) return false;
 
-    processingWindow = true;
+        botLog('TPA confirmation GUI detected.');
 
-    try {
-        log('CHEST MENU OPENED');
-        log('Title: ' + JSON.stringify(window.title));
+        const slot = window.slots.findIndex(item => {
+            if (!item) return false;
 
-        await delay(700);
+            const name = normalize(getItemText(item));
 
-        if (stopped || !bot.currentWindow) return;
+            return (
+                item.name === 'lime_shulker_box' ||
+                item.name === 'green_shulker_box' ||
+                (
+                    name.includes('shulker') &&
+                    (
+                        name.includes('lime') ||
+                        name.includes('green')
+                    )
+                )
+            );
+        });
 
-        // Custom respawn menu, if the server opens one.
-        if (awaitingRespawn) {
-            let respawnSlot = -1;
+        if (slot === -1) {
+            botLog('Green/lime shulker not found.');
+
+            window.slots.forEach((item, index) => {
+                if (item) {
+                    botLog(`TPA Slot ${index}: ${item.name} | ${item.displayName}`);
+                }
+            });
+
+            return true;
+        }
+
+        botLog(`Found confirmation item at slot ${slot}.`);
+
+        await bot.clickWindow(slot, 0, 0);
+
+        if (state.stopped) return true;
+
+        clearTimeout(state.tpaRetryTimer);
+
+        state.awaitingTpaGui = false;
+        state.teleportPending = true;
+
+        botLog('TPA confirmation clicked.');
+
+        state.tpaTimer = setTimeout(() => {
+            if (state.stopped) return;
+
+            state.teleportPending = false;
+
+            botLog('Teleport wait completed.');
+        }, 8000);
+
+        return true;
+    }
+
+    // ========================================================
+    // AUTOMATIC FOOD
+    // ========================================================
+
+    async function eatFoodIfNeeded() {
+        if (
+            state.stopped ||
+            !state.authReady ||
+            !bot.entity ||
+            bot.food === undefined ||
+            bot.food >= 18 ||
+            state.eating ||
+            bot.currentWindow
+        ) {
+            return;
+        }
+
+        const safeFood = [
+            'apple',
+            'bread',
+            'carrot',
+            'baked_potato',
+            'melon_slice',
+            'sweet_berries',
+            'glow_berries',
+            'cookie',
+            'pumpkin_pie',
+            'cooked_beef',
+            'cooked_porkchop',
+            'cooked_chicken',
+            'cooked_mutton',
+            'cooked_rabbit',
+            'cooked_cod',
+            'cooked_salmon',
+            'golden_carrot',
+            'golden_apple',
+            'beetroot',
+            'dried_kelp'
+        ];
+
+        const food = bot.inventory.items().find(item =>
+            safeFood.includes(item.name)
+        );
+
+        if (!food) return;
+
+        state.eating = true;
+
+        try {
+            botLog(`Eating ${food.name}...`);
+
+            await bot.equip(food, 'hand');
+
+            if (state.stopped) return;
+
+            await bot.consume();
+
+            botLog('Food consumed.');
+        } catch (err) {
+            botLog(`Food error: ${err.message}`);
+        } finally {
+            state.eating = false;
+        }
+    }
+
+    // ========================================================
+    // GUI HANDLER
+    // ========================================================
+
+    async function processWindow(window) {
+        if (
+            state.stopped ||
+            bot.currentWindow !== window
+        ) {
+            return;
+        }
+
+        state.processingWindow = true;
+
+        try {
+            botLog('========== GUI OPENED ==========');
+            botLog(`Title: ${getMessageText(window.title)}`);
+
+            await delay(700);
+
+            if (
+                state.stopped ||
+                bot.currentWindow !== window
+            ) {
+                return;
+            }
+
+            // TPA GUI
+
+            if (state.awaitingTpaGui) {
+                await handleTpaWindow(window);
+                return;
+            }
+
+            // Server selector GUI
+
+            if (state.modeSelected) return;
+
+            let targetSlot = -1;
 
             for (let i = 0; i < window.slots.length; i++) {
                 const item = window.slots[i];
@@ -320,171 +586,318 @@ bot.on('windowOpen', async window => {
 
                 const itemText = normalize(getItemText(item));
 
+                botLog(
+                    `Slot ${i}: ${item.name} | ${item.displayName}`
+                );
+
                 if (
-                    itemText.includes('respawn') ||
-                    itemText.includes('revive')
+                    item.name === 'red_dye' ||
+                    (
+                        itemText.includes('lifesteal') &&
+                        itemText.includes('red')
+                    )
                 ) {
-                    respawnSlot = i;
+                    targetSlot = i;
                     break;
                 }
             }
 
-            if (respawnSlot !== -1) {
-                log(`Found Respawn button at slot ${respawnSlot}.`);
-
-                await bot.clickWindow(respawnSlot, 0, 0);
-
-                log('Clicked Respawn!');
+            if (targetSlot === -1) {
+                botLog('Lifesteal Red Dye not found.');
                 return;
             }
-        }
 
-        if (modeSelected) return;
+            botLog(`Found Lifesteal at slot ${targetSlot}.`);
 
-        let targetSlot = -1;
+            await delay(800);
 
-        for (let i = 0; i < window.slots.length; i++) {
-            const item = window.slots[i];
-
-            if (!item) continue;
-
-            log(`Slot ${i}: ${item.name} | ${item.displayName}`);
-
-            if (item.name === 'golden_apple') {
-                targetSlot = i;
-                break;
+            if (
+                state.stopped ||
+                bot.currentWindow !== window
+            ) {
+                return;
             }
+
+            await bot.clickWindow(targetSlot, 0, 0);
+
+            state.modeSelected = true;
+
+            botLog('Lifesteal selected.');
+        } catch (err) {
+            botLog(`GUI error: ${err.message}`);
+        } finally {
+            state.processingWindow = false;
+        }
+    }
+
+    // ========================================================
+    // RESOURCE PACK
+    // ========================================================
+
+    bot.on('resourcePack', () => {
+        try {
+            bot.denyResourcePack();
+        } catch (err) {
+            botLog(`Resource pack error: ${err.message}`);
+        }
+    });
+
+    // ========================================================
+    // LOGIN
+    // ========================================================
+
+    bot.on('login', () => {
+        botLog(`Logged in as ${bot.username}.`);
+    });
+
+    // ========================================================
+    // SPAWN
+    // ========================================================
+
+    bot.on('spawn', () => {
+        if (state.stopped) return;
+
+        botLog('Spawned.');
+
+        if (state.modeSelected && !state.hasEnteredMode) {
+            enterMode('Spawn after Lifesteal selection');
         }
 
-        if (targetSlot === -1) {
-            log('Golden Apple not found!');
+        if (state.hasEnteredMode) {
+            clearTimeout(state.tpaTimer);
+            state.teleportPending = false;
+
+            setTimeout(() => {
+                if (state.stopped) return;
+                requestTeleport();
+            }, 2000);
+        }
+    });
+
+    // ========================================================
+    // SERVER MESSAGES
+    // ========================================================
+
+    bot.on('message', message => {
+        if (state.stopped) return;
+
+        const text = getMessageText(message);
+
+        if (!text) return;
+
+        handleAuthentication(message);
+
+        const normalized = normalize(text);
+
+        if (
+            normalized.includes('welcome') &&
+            normalized.includes('tolifesteal')
+        ) {
+            enterMode('Lifesteal welcome message');
+        }
+
+        if (
+            normalized.includes('teleportingto') ||
+            normalized.includes('teleportedsuccessfully') ||
+            normalized.includes('teleportationcomplete')
+        ) {
+            state.teleportPending = false;
+            botLog('Teleport confirmation received.');
+        }
+    });
+
+    // ========================================================
+    // CHAT
+    // ========================================================
+
+    bot.on('chat', (player, message) => {
+        if (state.stopped) return;
+    });
+
+    // ========================================================
+    // WINDOW OPEN
+    // ========================================================
+
+    bot.on('windowOpen', window => {
+        state.windowQueue = state.windowQueue
+            .then(() => processWindow(window))
+            .catch(err => {
+                botLog(`Window queue error: ${err.message}`);
+            });
+    });
+
+    // ========================================================
+    // SELECTOR LOOP
+    // ========================================================
+
+    state.selectorInterval = setInterval(() => {
+        if (
+            state.stopped ||
+            !state.authReady ||
+            !bot.entity ||
+            state.selectorUsed ||
+            state.modeSelected
+        ) {
             return;
         }
 
-        log(`Found Golden Apple at slot ${targetSlot}.`);
+        openServerSelector();
+    }, 3000);
 
-        await delay(1000);
+    // ========================================================
+    // FOOD LOOP
+    // ========================================================
 
-        if (stopped || !bot.currentWindow) return;
+    state.foodInterval = setInterval(() => {
+        eatFoodIfNeeded();
+    }, 5000);
 
-        await bot.clickWindow(targetSlot, 0, 0);
+    // ========================================================
+    // DEATH / RESPAWN
+    // ========================================================
 
-        modeSelected = true;
+    bot.on('death', () => {
+        if (state.stopped) return;
 
-        log('Clicked Golden Apple!');
-        log('Waiting to enter OP Lifesteal...');
+        botLog('Bot died.');
 
-    } catch (err) {
-        log('GUI error: ' + err.message);
-    } finally {
-        processingWindow = false;
-    }
-});
+        state.teleportPending = false;
+        state.awaitingTpaGui = false;
 
-// ============================================================
-// AUTOMATIC SERVER SELECTOR
-// ============================================================
+        clearTimeout(state.tpaTimer);
+        clearTimeout(state.tpaRetryTimer);
 
-let selectorAttempts = 0;
+        state.respawnTimer = setTimeout(() => {
+            if (state.stopped) return;
 
-const selectorInterval = setInterval(async () => {
-    if (stopped || !bot.entity || selectorUsed || modeSelected) return;
+            try {
+                botLog('Requesting respawn...');
+                bot.respawn();
+            } catch (err) {
+                botLog(`Respawn error: ${err.message}`);
+            }
+        }, DEATH_RESPAWN_DELAY);
+    });
 
-    selectorAttempts++;
+    // ========================================================
+    // KICK
+    // ========================================================
 
-    if (selectorAttempts > 15) {
-        clearInterval(selectorInterval);
-        log('Could not automatically open Server Selector.');
-        return;
-    }
+    bot.on('kicked', (reason, loggedIn) => {
+        botLog('========== KICKED ==========');
+        botLog(`Reason: ${getMessageText(reason)}`);
+        botLog(`Logged in: ${loggedIn}`);
 
-    await openServerSelector();
-}, 2000);
+        state.stopped = true;
+        clearTimers();
+    });
 
-// ============================================================
-// DEATH / RESPAWN
-// ============================================================
+    // ========================================================
+    // ERRORS
+    // ========================================================
 
-bot.on('death', async () => {
-    if (stopped || awaitingRespawn) return;
+    bot.on('error', err => {
+        botLog(`ERROR: ${err.message}`);
+    });
 
-    log('Bot died!');
-    awaitingRespawn = true;
+    // ========================================================
+    // DISCONNECT
+    // ========================================================
 
-    await delay(1500);
+    bot.on('end', reason => {
+        botLog(`Disconnected: ${String(reason || 'Unknown')}`);
 
-    if (stopped || !awaitingRespawn) return;
+        state.stopped = true;
+        clearTimers();
 
-    try {
-        log('Requesting respawn...');
-        bot.respawn();
-    } catch (err) {
-        log('Respawn error: ' + err.message);
-    }
-});
+        bots.delete(username);
 
-// ============================================================
-// PLAYER CHAT
-// ============================================================
+        if (!shuttingDown) {
+            scheduleBots();
+        }
+    });
 
-bot.on('chat', (username, message) => {
-    console.log(`[PLAYER CHAT] ${username}: ${message}`);
+    bots.set(username, bot);
 
-    if (stopped) return;
+    bot._agentState = state;
 
-    if (isBanMessage(message)) {
-        stopBot('Ban detected: ' + message);
-    }
-});
-
-// ============================================================
-// KICK / BAN
-// ============================================================
-
-bot.on('kicked', reason => {
-    const text = getMessageText(reason);
-
-    console.log('[KICKED]', text);
-
-    stopBot(
-        isBanMessage(text)
-            ? 'Ban detected: ' + text
-            : 'Server disconnected the bot: ' + text
-    );
-});
+    return bot;
+}
 
 // ============================================================
-// ERRORS / DISCONNECTION
+// SPAWN SYSTEM
 // ============================================================
 
-bot.on('error', err => {
-    console.error('[ERROR]', err.stack || err);
-});
+function scheduleBots() {
+    if (shuttingDown || spawnTimer) return;
 
-bot.on('end', reason => {
-    log(`Disconnected: ${reason || 'Unknown reason'}`);
+    if (bots.size >= MAX_BOTS) return;
 
-    stopped = true;
-    clearInterval(selectorInterval);
+    spawnTimer = setTimeout(() => {
+        spawnTimer = null;
 
-    if (tpaTimer) clearTimeout(tpaTimer);
-});
+        if (shuttingDown || bots.size >= MAX_BOTS) return;
+
+        spawnGanger();
+
+        if (bots.size < MAX_BOTS) {
+            scheduleBots();
+        }
+    }, SPAWN_DELAY);
+}
+
+function spawnGanger() {
+    if (shuttingDown || bots.size >= MAX_BOTS) return;
+
+    botCounter++;
+
+    const username = `ViratKh${randomThreeLetters()}`;
+
+    log('SYSTEM', '================================');
+    log('SYSTEM', `Creating Bot #${botCounter}`);
+    log('SYSTEM', `Username: ${username}`);
+    log('SYSTEM', `Active bots: ${bots.size + 1}/${MAX_BOTS}`);
+    log('SYSTEM', '================================');
+
+    createBot(username);
+}
 
 // ============================================================
-// MANUAL STOP
+// START
+// ============================================================
+
+log('SYSTEM', 'Starting multi-bot system.');
+log('SYSTEM', `Maximum bots: ${MAX_BOTS}`);
+log('SYSTEM', `Teleport target: ${DUDETNT}`);
+log('SYSTEM', 'Inventory dropping: DISABLED');
+log('SYSTEM', 'Kit selection: DISABLED');
+log('SYSTEM', 'Automatic food: ENABLED');
+
+setTimeout(() => {
+    spawnGanger();
+    scheduleBots();
+}, FIRST_SPAWN_DELAY);
+
+// ============================================================
+// SHUTDOWN
 // ============================================================
 
 process.on('SIGINT', () => {
-    log('Stopping bot...');
+    log('SYSTEM', 'Shutting down all bots...');
 
-    stopped = true;
-    clearInterval(selectorInterval);
+    shuttingDown = true;
 
-    if (tpaTimer) clearTimeout(tpaTimer);
+    clearTimeout(spawnTimer);
 
-    try {
-        bot.quit();
-    } catch {}
+    for (const [username, bot] of bots) {
+        log('SYSTEM', `Disconnecting ${username}`);
+
+        try {
+            bot.quit();
+        } catch {}
+    }
+
+    bots.clear();
 
     process.exit(0);
 });
