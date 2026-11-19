@@ -851,7 +851,7 @@ function spawnGanger() {
 
     botCounter++;
 
-    const username = `MohanJudariooo{randomThreeLetters()}`;
+    const username = `MohanJudariooo${randomThreeLetters()}`;
 
     log('SYSTEM', '================================');
     log('SYSTEM', `Creating Bot #${botCounter}`);
